@@ -13,9 +13,8 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- настройки из секретов/переменных ---------------------------------
-GIGACHAT_CLIENT_ID = os.environ["GIGACHAT_CLIENT_ID"]
-GIGACHAT_API_KEY = os.environ["GIGACHAT_API_KEY"]
-GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_B2B")
+GIGACHAT_AUTH_KEY = os.environ["GIGACHAT_AUTH_KEY"]  # Единый ключ авторизации
+GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
 GIGACHAT_IMAGE_MODEL = os.getenv("GIGACHAT_IMAGE_MODEL", "preview")
 
 TG_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -30,11 +29,15 @@ CHAT_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat"
 
 def gigachat_token() -> str:
     """OAuth 2.0 токен для GigaChat API."""
-    basic = base64.b64encode(f"{GIGACHAT_CLIENT_ID}:{GIGACHAT_API_KEY}".encode()).decode()
     resp = requests.post(
         OAUTH_URL,
-        headers={"Authorization": f"Basic {basic}", "RqUID": str(uuid.uuid4())},
-        data={"scope": GIGACHAT_SCOPE},
+        headers={
+            "Authorization": f"Basic {GIGACHAT_AUTH_KEY}",
+            "RqUID": str(uuid.uuid4()),
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+        data=f"scope={GIGACHAT_SCOPE}",
         verify=False,
         timeout=30,
     )
@@ -57,7 +60,7 @@ def generate_image(token: str, prompt: str) -> bytes:
 
     for item in payload.get("data", []):
         if item.get("type") == "image":
-            b64 = item["content"].split(",", 1)[-1]  # на случай data:image/...;base64,
+            b64 = item["content"].split(",", 1)[-1]
             return base64.b64decode(b64)
 
     raise RuntimeError(f"В ответе GigaChat нет картинки: {payload}")
