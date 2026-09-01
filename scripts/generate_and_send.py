@@ -23,7 +23,12 @@ PROMPTS_FILE = Path(os.getenv("PROMPTS_FILE", "prompts/prompts.json"))
 STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
 
 OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
-API_BASE_URL = "https://api.giga.chat/api/v1"
+
+# Пробуем оба варианта URL
+API_URLS = [
+    "https://api.giga.chat/v1",  # Новый URL
+    "https://gigachat.devices.sberbank.ru/api/v1",  # Старый URL
+]
 
 
 def gigachat_token() -> str:
@@ -44,10 +49,10 @@ def gigachat_token() -> str:
     return resp.json()["access_token"]
 
 
-def list_models(token: str) -> list:
+def list_models(token: str, base_url: str) -> list:
     """Получить список доступных моделей."""
     resp = requests.get(
-        f"{API_BASE_URL}/models",
+        f"{base_url}/models",
         headers={
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
@@ -59,13 +64,13 @@ def list_models(token: str) -> list:
     return resp.json().get("data", [])
 
 
-def generate_image(token: str, prompt: str, model: str) -> bytes:
+def generate_image(token: str, prompt: str, model: str, base_url: str) -> bytes:
     """Генерация картинки через chat/completions с function_call."""
-    print(f"Используем модель: {model}")
+    print(f"Используем модель: {model} на {base_url}")
     
     # Запрос на генерацию
     resp = requests.post(
-        f"{API_BASE_URL}/chat/completions",
+        f"{base_url}/chat/completions",
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -103,7 +108,7 @@ def generate_image(token: str, prompt: str, model: str) -> bytes:
     
     # Скачиваем картинку
     resp = requests.get(
-        f"{API_BASE_URL}/files/{file_id}/content",
+        f"{base_url}/files/{file_id}/content",
         headers={
             "Authorization": f"Bearer {token}",
             "Accept": "application/jpg",
@@ -144,27 +149,33 @@ def main() -> None:
     print(f"Промпт #{index}: {prompt}")
 
     token = gigachat_token()
-    print("Токен получен успешно")
+    print("Токен получен успешно\n")
     
-    # Получаем список моделей
-    models = list_models(token)
-    print(f"Доступные модели: {[m['id'] for m in models]}")
-    
-    # Пробуем модели по порядку
-    for model in models:
-        model_id = model['id']
+    # Пробуем каждый URL
+    for base_url in API_URLS:
+        print(f"Пробуем URL: {base_url}")
         try:
-            print(f"\nПытаемся использовать модель: {model_id}")
-            image = generate_image(token, prompt, model_id)
-            print(f"Картинка готова: {len(image)} байт")
-            send_to_telegram(image, caption=f"{prompt}\n(промпт #{index}, модель {model_id})")
-            print("Отправлено в Telegram.")
-            return
+            models = list_models(token, base_url)
+            print(f"✓ Доступные модели: {[m['id'] for m in models]}\n")
+            
+            # Пробуем модели по порядку
+            for model in models:
+                model_id = model['id']
+                try:
+                    print(f"Пытаемся использовать модель: {model_id}")
+                    image = generate_image(token, prompt, model_id, base_url)
+                    print(f"Картинка готова: {len(image)} байт")
+                    send_to_telegram(image, caption=f"{prompt}\n(промпт #{index}, модель {model_id})")
+                    print("Отправлено в Telegram.")
+                    return
+                except Exception as e:
+                    print(f"✗ Ошибка с моделью {model_id}: {e}\n")
+                    continue
         except Exception as e:
-            print(f"Ошибка с моделью {model_id}: {e}")
+            print(f"✗ Ошибка с URL {base_url}: {e}\n")
             continue
     
-    raise RuntimeError("Не удалось сгенерировать картинку ни с одной моделью")
+    raise RuntimeError("Не удалось сгенерировать картинку ни с одним URL/моделью")
 
 
 if __name__ == "__main__":
