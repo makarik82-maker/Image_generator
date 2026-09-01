@@ -3,10 +3,10 @@ name: GigaChat → Telegram
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 9 * * *"   # раз в день в 09:00 UTC (поменяйте под свой график)
+    - cron: "0 9 * * *"
 
 permissions:
-  contents: write          # нужно для коммита state.json
+  contents: write
 
 jobs:
   generate-and-send:
@@ -23,9 +23,8 @@ jobs:
 
       - name: Generate image and send to Telegram
         env:
-          GIGACHAT_CLIENT_ID: ${{ secrets.GIGACHAT_CLIENT_ID }}
-          GIGACHAT_API_KEY: ${{ secrets.GIGACHAT_API_KEY }}
-          GIGACHAT_SCOPE: GIGACHAT_API_PERS      # для физлиц; для юрлиц — GIGACHAT_API_B2B
+          GIGACHAT_AUTH_KEY: ${{ secrets.GIGACHAT_AUTH_KEY }}
+          GIGACHAT_SCOPE: GIGACHAT_API_PERS
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python scripts/generate_and_send.py
