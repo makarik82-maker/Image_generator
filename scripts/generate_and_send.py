@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Берёт следующий промпт из базы, генерирует картинку в GigaChat
 и отправляет её в Telegram-чат."""
-import base64
 import json
 import os
 import re
@@ -25,7 +24,7 @@ PROMPTS_FILE = Path(os.getenv("PROMPTS_FILE", "prompts/prompts.json"))
 STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
 
 OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
-API_BASE_URL = "https://api.giga.chat/v1"
+API_BASE_URL = "https://api.giga.chat/api/v1"  # <-- Добавлен /api
 
 
 def gigachat_token() -> str:
