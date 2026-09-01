@@ -1,0 +1,39 @@
+name: GigaChat → Telegram
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 9 * * *"   # раз в день в 09:00 UTC (поменяйте под свой график)
+
+permissions:
+  contents: write          # нужно для коммита state.json
+
+jobs:
+  generate-and-send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Generate image and send to Telegram
+        env:
+          GIGACHAT_CLIENT_ID: ${{ secrets.GIGACHAT_CLIENT_ID }}
+          GIGACHAT_API_KEY: ${{ secrets.GIGACHAT_API_KEY }}
+          GIGACHAT_SCOPE: GIGACHAT_API_PERS      # для физлиц; для юрлиц — GIGACHAT_API_B2B
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/generate_and_send.py
+
+      - name: Save prompt index
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git diff --staged --quiet || git commit -m "chore: advance prompt index"
+          git push
