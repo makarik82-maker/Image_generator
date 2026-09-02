@@ -5,98 +5,79 @@ import json
 import os
 import re
 import uuid
+import logging
 from pathlib import Path
 
 import requests
 import urllib3
 
+# Подавляем предупреждения о непроверенных HTTPS-запросах
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# --- настройки из секретов/переменных ---------------------------------
-GIGACHAT_AUTH_KEY = os.environ["GIGACHAT_AUTH_KEY"]
-GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
-TG_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TG_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+# --- настройки из секретов/переменных ---------------------------------
+GIGACHAT_CREDENTIALS = os.environ["GIGACHAT_CREDENTIALS"]
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 PROMPTS_FILE = Path(os.getenv("PROMPTS_FILE", "prompts/prompts.json"))
 STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
 
 OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
-
-# Пробуем оба варианта URL
-API_URLS = [
-    "https://api.giga.chat/v1",  # Новый URL
-    "https://gigachat.devices.sberbank.ru/api/v1",  # Старый URL
-]
+API_URL = "https://api.giga.chat/v1"
+VERIFY_SSL = False
 
 
-def gigachat_token() -> str:
-    """OAuth 2.0 токен для GigaChat API."""
-    resp = requests.post(
-        OAUTH_URL,
-        headers={
-            "Authorization": f"Basic {GIGACHAT_AUTH_KEY}",
-            "RqUID": str(uuid.uuid4()),
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-        },
-        data=f"scope={GIGACHAT_SCOPE}",
-        verify=False,
-        timeout=30,
+def get_gigachat_token() -> str:
+    """Получает OAuth-токен GigaChat (как в рабочем коде)."""
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+        "RqUID": str(uuid.uuid4()),
+        "Authorization": f"Basic {GIGACHAT_CREDENTIALS}",
+    }
+    data = {"scope": "GIGACHAT_API_PERS"}
+
+    response = requests.post(
+        OAUTH_URL, headers=headers, data=data,
+        verify=VERIFY_SSL, timeout=30
     )
-    resp.raise_for_status()
-    return resp.json()["access_token"]
+    response.raise_for_status()
+    token = response.json()["access_token"]
+    logger.info("✅ Токен GigaChat успешно получен")
+    return token
 
 
-def list_models(token: str, base_url: str) -> list:
-    """Получить список доступных моделей."""
-    resp = requests.get(
-        f"{base_url}/models",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-        },
-        verify=False,
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json().get("data", [])
-
-
-def generate_image(token: str, prompt: str, model: str, base_url: str) -> bytes:
+def generate_image(token: str, prompt: str) -> bytes:
     """Генерация картинки через chat/completions с function_call."""
-    print(f"Используем модель: {model} на {base_url}")
+    url = f"{API_URL}/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
     
-    # Запрос на генерацию
-    resp = requests.post(
-        f"{base_url}/chat/completions",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        json={
-            "model": model,
-            "messages": [
-                {"role": "user", "content": prompt}
-            ],
-            "function_call": "auto"
-        },
-        verify=False,
-        timeout=300,
+    payload = {
+        "model": "GigaChat-2",
+        "messages": [
+            {"role": "system", "content": "Ты — художник. Нарисуй то, что тебя попросят."},
+            {"role": "user", "content": prompt}
+        ],
+        "function_call": "auto"
+    }
+
+    logger.info("📤 Отправляю запрос на генерацию картинки...")
+    response = requests.post(
+        url, headers=headers, json=payload,
+        verify=VERIFY_SSL, timeout=300
     )
+    response.raise_for_status()
     
-    if resp.status_code == 403:
-        print(f"Ответ сервера: {resp.text}")
-        raise RuntimeError(f"Доступ запрещён. Ответ: {resp.text}")
-    
-    resp.raise_for_status()
-    payload = resp.json()
-    
-    # Извлекаем идентификатор картинки из ответа
-    content = payload["choices"][0]["message"]["content"]
-    print(f"Ответ модели: {content}")
+    result = response.json()
+    content = result["choices"][0]["message"]["content"]
+    logger.info(f"Ответ модели: {content[:100]}...")
     
     # Ищем <img src="uuid">
     match = re.search(r'<img\s+src="([^"]+)"', content)
@@ -104,16 +85,15 @@ def generate_image(token: str, prompt: str, model: str, base_url: str) -> bytes:
         raise RuntimeError(f"В ответе не найден идентификатор картинки: {content}")
     
     file_id = match.group(1)
-    print(f"Идентификатор картинки: {file_id}")
+    logger.info(f"🆔 Идентификатор картинки: {file_id}")
     
     # Скачиваем картинку
+    download_url = f"{API_URL}/files/{file_id}/content"
+    logger.info("⬇️ Скачиваю картинку...")
     resp = requests.get(
-        f"{base_url}/files/{file_id}/content",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/jpg",
-        },
-        verify=False,
+        download_url,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/jpg"},
+        verify=VERIFY_SSL,
         timeout=60,
     )
     resp.raise_for_status()
@@ -121,9 +101,10 @@ def generate_image(token: str, prompt: str, model: str, base_url: str) -> bytes:
 
 
 def send_to_telegram(image: bytes, caption: str) -> None:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     resp = requests.post(
-        f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto",
-        data={"chat_id": TG_CHAT_ID, "caption": caption[:1024]},
+        url,
+        data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1024]},
         files={"photo": ("image.jpg", image, "image/jpeg")},
         timeout=60,
     )
@@ -146,36 +127,14 @@ def take_next_prompt() -> tuple[int, str]:
 
 def main() -> None:
     index, prompt = take_next_prompt()
-    print(f"Промпт #{index}: {prompt}")
+    logger.info(f"📝 Промпт #{index}: {prompt}")
 
-    token = gigachat_token()
-    print("Токен получен успешно\n")
-    
-    # Пробуем каждый URL
-    for base_url in API_URLS:
-        print(f"Пробуем URL: {base_url}")
-        try:
-            models = list_models(token, base_url)
-            print(f"✓ Доступные модели: {[m['id'] for m in models]}\n")
-            
-            # Пробуем модели по порядку
-            for model in models:
-                model_id = model['id']
-                try:
-                    print(f"Пытаемся использовать модель: {model_id}")
-                    image = generate_image(token, prompt, model_id, base_url)
-                    print(f"Картинка готова: {len(image)} байт")
-                    send_to_telegram(image, caption=f"{prompt}\n(промпт #{index}, модель {model_id})")
-                    print("Отправлено в Telegram.")
-                    return
-                except Exception as e:
-                    print(f"✗ Ошибка с моделью {model_id}: {e}\n")
-                    continue
-        except Exception as e:
-            print(f"✗ Ошибка с URL {base_url}: {e}\n")
-            continue
-    
-    raise RuntimeError("Не удалось сгенерировать картинку ни с одним URL/моделью")
+    token = get_gigachat_token()
+    image = generate_image(token, prompt)
+    logger.info(f"🖼️ Картинка готова: {len(image)} байт")
+
+    send_to_telegram(image, caption=f"{prompt}\n(промпт #{index})")
+    logger.info("✅ Отправлено в Telegram.")
 
 
 if __name__ == "__main__":
