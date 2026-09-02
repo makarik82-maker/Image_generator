@@ -3,7 +3,7 @@ name: GigaChat → Telegram
 on:
   workflow_dispatch: {}
   schedule:
-  
+    - cron: "0 9 * * *"
 
 permissions:
   contents: write
@@ -23,13 +23,13 @@ jobs:
 
       - name: Generate image and send to Telegram
         env:
-          GIGACHAT_AUTH_KEY: ${{ secrets.GIGACHAT_AUTH_KEY }}
-          GIGACHAT_SCOPE: GIGACHAT_API_PERS
+          GIGACHAT_CREDENTIALS: ${{ secrets.GIGACHAT_CREDENTIALS }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python scripts/generate_and_send.py
 
       - name: Save prompt index
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
