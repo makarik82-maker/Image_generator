@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Берёт следующий промпт из базы, генерирует картинку в GigaChat
-и отправляет её в Telegram-чат.
+"""Берёт ВСЕ промпты из базы, генерирует картинки в GigaChat
+и отправляет их в Telegram-чат по очереди.
 
 Следует официальной документации:
 https://developers.sber.ru/docs/ru/gigachat/guides/images-generation
@@ -10,6 +10,7 @@ import os
 import re
 import uuid
 import logging
+import time
 from pathlib import Path
 
 import requests
@@ -33,9 +34,12 @@ OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
 API_URL = "https://api.giga.chat/v1"
 VERIFY_SSL = False
 
+# Задержка между отправками в Telegram (секунды)
+TELEGRAM_DELAY = 2
+
 
 def get_gigachat_token() -> str:
-    """Получает OAuth-токен GigaChat (согласно документации)."""
+    """Получает OAuth-токен GigaChat."""
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
@@ -57,12 +61,6 @@ def get_gigachat_token() -> str:
 def generate_image(token: str, prompt: str) -> bytes:
     """
     Генерация картинки через chat/completions с function_call.
-    
-    Согласно документации GigaChat:
-    - POST /chat/completions с function_call: "auto"
-    - Модель возвращает <img src="uuid"> в content
-    - Картинку скачиваем через GET /files/{file_id}/content
-    - Формат: JPG
     """
     url = f"{API_URL}/chat/completions"
     headers = {
@@ -71,7 +69,6 @@ def generate_image(token: str, prompt: str) -> bytes:
         "Authorization": f"Bearer {token}",
     }
     
-    # Системный промпт согласно документации для стилизации изображений
     system_prompt = "Ты — профессиональный художник и иллюстратор. Создавай высококачественные изображения."
     
     payload = {
@@ -80,11 +77,10 @@ def generate_image(token: str, prompt: str) -> bytes:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt}
         ],
-        "function_call": "auto"  # Обязательный параметр для активации text2image
+        "function_call": "auto"
     }
 
     logger.info("📤 Отправляю запрос на генерацию картинки...")
-    logger.info(f"💬 Промпт: {prompt[:100]}...")
     
     response = requests.post(
         url, headers=headers, json=payload,
@@ -93,17 +89,12 @@ def generate_image(token: str, prompt: str) -> bytes:
     response.raise_for_status()
     
     result = response.json()
-    
-    # Извлекаем контент ответа
     message = result["choices"][0]["message"]
     content = message.get("content", "")
-    logger.info(f"📨 Ответ модели: {content[:150]}...")
     
-    # Проверяем finish_reason (согласно документации)
     finish_reason = result["choices"][0].get("finish_reason")
     logger.info(f"🏁 finish_reason: {finish_reason}")
     
-    # Ищем <img src="uuid"> согласно документации
     match = re.search(r'<img\s+src="([^"]+)"', content)
     if not match:
         raise RuntimeError(f"В ответе не найден идентификатор картинки: {content}")
@@ -111,10 +102,7 @@ def generate_image(token: str, prompt: str) -> bytes:
     file_id = match.group(1)
     logger.info(f"🆔 Идентификатор картинки: {file_id}")
     
-    # Скачиваем картинку через GET /files/{file_id}/content
     download_url = f"{API_URL}/files/{file_id}/content"
-    logger.info("⬇️ Скачиваю картинку...")
-    
     resp = requests.get(
         download_url,
         headers={
@@ -131,27 +119,13 @@ def generate_image(token: str, prompt: str) -> bytes:
 
 
 def send_to_telegram(image: bytes, caption: str) -> None:
-    """
-    Отправляет картинку в Telegram с подробной диагностикой.
-    
-    Telegram API:
-    - POST /sendPhoto
-    - chat_id: ID чата/канала
-    - caption: текст (лимит 1024 символа)
-    - photo: файл изображения
-    """
+    """Отправляет картинку в Telegram."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     
-    logger.info(f"📤 Отправляю в Telegram chat_id={TELEGRAM_CHAT_ID}")
-    
-    # Telegram имеет строгий лимит 1024 символа для caption
     MAX_CAPTION_LENGTH = 1024
     if len(caption) > MAX_CAPTION_LENGTH:
-        original_length = len(caption)
         caption = caption[:MAX_CAPTION_LENGTH - 3] + "..."
-        logger.warning(f"⚠️ Caption обрезан с {original_length} до {len(caption)} символов")
-    
-    logger.info(f"📝 Caption: {caption[:100]}...")
+        logger.warning(f"⚠️ Caption обрезан до {len(caption)} символов")
     
     resp = requests.post(
         url,
@@ -160,7 +134,6 @@ def send_to_telegram(image: bytes, caption: str) -> None:
         timeout=60,
     )
     
-    # Подробная диагностика ошибок
     if resp.status_code != 200:
         logger.error(f"❌ Telegram API вернул статус {resp.status_code}")
         logger.error(f"Ответ Telegram: {resp.text}")
@@ -170,24 +143,16 @@ def send_to_telegram(image: bytes, caption: str) -> None:
             error_code = error_data.get("error_code")
             description = error_data.get("description", "")
             
-            logger.error(f"Код ошибки: {error_code}")
-            logger.error(f"Описание: {description}")
+            logger.error(f"Код ошибки: {error_code}, Описание: {description}")
             
-            # Подсказки по типичным ошибкам
             if error_code == 400:
-                logger.error("💡 Ошибка 400 - возможные причины:")
-                logger.error("   • Неверный chat_id (проверьте секрет TELEGRAM_CHAT_ID)")
-                logger.error("   • Бот не добавлен в чат/канал")
-                logger.error("   • Caption содержит недопустимые символы")
-                logger.error("   • Проблема с форматом изображения")
+                logger.error("💡 Возможные причины: неверный chat_id, бот не в чате, caption слишком длинный")
             elif error_code == 401:
-                logger.error("💡 Ошибка 401 - неверный TELEGRAM_BOT_TOKEN")
+                logger.error("💡 Неверный TELEGRAM_BOT_TOKEN")
             elif error_code == 403:
-                logger.error("💡 Ошибка 403 - бот заблокирован или не имеет прав")
-                logger.error("   • Добавьте бота в канал как администратора")
-                logger.error("   • Или в группу/чат как участника")
+                logger.error("💡 Бот заблокирован или не имеет прав")
             elif error_code == 429:
-                logger.error("💡 Ошибка 429 - превышен лимит запросов (rate limit)")
+                logger.error("💡 Превышен лимит запросов")
         except Exception as e:
             logger.error(f"Не удалось распарсить ответ: {e}")
     
@@ -195,40 +160,46 @@ def send_to_telegram(image: bytes, caption: str) -> None:
     logger.info("✅ Картинка успешно отправлена в Telegram!")
 
 
-def take_next_prompt() -> tuple[int, str]:
-    """Возвращает очередной промпт и сдвигает указатель (по кругу)."""
+def main() -> None:
+    logger.info("🚀 Запуск генератора ВСЕХ изображений GigaChat → Telegram")
+    
+    # Загружаем все промпты
     prompts = json.loads(PROMPTS_FILE.read_text(encoding="utf-8"))
     if not prompts:
         raise RuntimeError("База промптов пуста")
-
-    state = json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
-    index = int(state.get("next_index", 0)) % len(prompts)
-
-    state["next_index"] = (index + 1) % len(prompts)
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     
-    logger.info(f"📊 Текущий индекс: {index}, следующий будет: {state['next_index']}")
-    return index, prompts[index]
-
-
-def main() -> None:
-    logger.info("🚀 Запуск генератора изображений GigaChat → Telegram")
+    logger.info(f"📚 Загружено промптов: {len(prompts)}")
     
-    # 1. Берём следующий промпт
-    index, prompt = take_next_prompt()
-    logger.info(f"📝 Промпт #{index}: {prompt}")
-
-    # 2. Получаем токен
+    # Получаем токен один раз на все промпты
     token = get_gigachat_token()
     
-    # 3. Генерируем картинку
-    image = generate_image(token, prompt)
+    # Проходим по ВСЕМ промптам
+    for index, prompt in enumerate(prompts, start=1):
+        logger.info(f"\n{'='*60}")
+        logger.info(f"📝 Промпт {index}/{len(prompts)}: {prompt}")
+        logger.info(f"{'='*60}")
+        
+        try:
+            # Генерируем картинку
+            image = generate_image(token, prompt)
+            
+            # Отправляем в Telegram
+            caption = f"{prompt}\n\n(промпт {index}/{len(prompts)})"
+            send_to_telegram(image, caption=caption)
+            
+            logger.info(f"✅ Промпт {index}/{len(prompts)} успешно обработан!")
+            
+            # Задержка между отправками
+            if index < len(prompts):
+                logger.info(f"⏳ Пауза {TELEGRAM_DELAY} сек перед следующим промптом...")
+                time.sleep(TELEGRAM_DELAY)
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка при обработке промпта {index}: {e}")
+            logger.error("Продолжаю с следующим промптом...")
+            continue
     
-    # 4. Отправляем в Telegram
-    caption = f"{prompt}\n\n(промпт #{index})"
-    send_to_telegram(image, caption=caption)
-    
-    logger.info("🎉 Миссия выполнена успешно!")
+    logger.info(f"\n🎉 Обработка всех {len(prompts)} промптов завершена!")
 
 
 if __name__ == "__main__":
