@@ -82,7 +82,7 @@ def generate_image(token: str, prompt: str) -> bytes:
         headers={"Authorization": f"Bearer {token}",
                  "Content-Type": "application/json"},
         json={
-            "model": "GigaChat-2",
+            "model": "GigaChat-3-Ultra",
             "messages": [
                 {"role": "system", "content": "Ты — профессиональный художник."},
                 {"role": "user", "content": prompt},
@@ -116,7 +116,7 @@ def generate_text(token: str, chat_id: int, user_text: str) -> str:
         f"{API_URL}/chat/completions",
         headers={"Authorization": f"Bearer {token}",
                  "Content-Type": "application/json"},
-        json={"model": "GigaChat-2", "messages": messages,
+        json={"model": "GigaChat-3-Ultra", "messages": messages,
               "temperature": 0.7, "max_tokens": 800},
         verify=VERIFY_SSL, timeout=60,
     )
