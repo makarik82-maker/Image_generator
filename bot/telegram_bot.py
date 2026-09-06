@@ -1,37 +1,64 @@
 #!/usr/bin/env python3
 """
-Telegram-бот на GigaChat:
-• 🎨 рисует картинки по описанию
-• 💬 общается в чатах (личных и групповых)
+Telegram-бот на Qwen (DashScope / Alibaba Cloud Model Studio):
+• 🎨 рисует картинки по описанию — Qwen-Image (нативный асинхронный API)
+• 💬 общается в чатах (личных и групповых) — Qwen-Plus (OpenAI-совместимый API)
+• 🔁 keep-alive: пингует собственный сервис на Render, чтобы тот не засыпал
 """
 import os
 import re
 import time
-import uuid
 import logging
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 import telebot
-import urllib3
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────── Настройки ─────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-GIGACHAT_CREDENTIALS = os.environ.get("GIGACHAT_CREDENTIALS")
+QWEN_API_KEY = os.environ.get("QWEN_API_KEY")
 
-OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
-API_URL = "https://api.giga.chat/v1"
-VERIFY_SSL = False
+# Базовый URL DashScope:
+#   Китай (Пекин):  https://dashscope.aliyuncs.com
+#   Сингапур:       https://dashscope-intl.aliyuncs.com
+QWEN_BASE_URL = os.environ.get("QWEN_BASE_URL", "https://dashscope.aliyuncs.com").rstrip("/")
 
-MAX_PROMPT_LENGTH = 1000
-IMAGE_PER_HOUR = 20      # лимит картинок на пользователя
-TEXT_PER_HOUR = 60       # лимит текстовых ответов
+QWEN_TEXT_MODEL = os.environ.get("QWEN_TEXT_MODEL", "qwen-plus")
+QWEN_IMAGE_MODEL = os.environ.get("QWEN_IMAGE_MODEL", "qwen-image")
+# Поддерживаемые размеры: 1664*928 (16:9, дефолт), 1472*1104, 1328*1328, 1104*1472, 928*1664
+QWEN_IMAGE_SIZE = os.environ.get("QWEN_IMAGE_SIZE", "1328*1328")
+
+# Нативный API генерации изображений (только асинхронный режим)
+IMAGE_TASK_URL = f"{QWEN_BASE_URL}/api/v1/services/aigc/text2image/image-synthesis"
+TASK_STATUS_URL = f"{QWEN_BASE_URL}/api/v1/tasks"
+# OpenAI-совместимый API для текстовых ответов
+TEXT_API_URL = f"{QWEN_BASE_URL}/compatible-mode/v1"
+
+IMAGE_POLL_INTERVAL = 5    # сек между опросами статуса задачи
+IMAGE_TIMEOUT = 300        # макс. время ожидания генерации картинки, сек
+
+MAX_TEXT_LENGTH = 1000     # лимит длины текстового сообщения
+MAX_IMAGE_PROMPT_LENGTH = 800  # лимит промпта у Qwen-Image — 800 символов
+IMAGE_PER_HOUR = 20        # лимит картинок на пользователя
+TEXT_PER_HOUR = 60         # лимит текстовых ответов
 COOLDOWN_SECONDS = 5
-MAX_HISTORY = 20         # сколько сообщений диалога помним
+MAX_HISTORY = 20           # сколько сообщений диалога помним
+
+# ─────────────── Keep-alive для Render (чтобы сервис не засыпал) ───────────────
+# Сервис засыпает, если не получает запрос дольше ~50 сек —
+# пингуем себя чаще этого интервала.
+KEEPALIVE_INTERVAL = int(os.environ.get("KEEPALIVE_INTERVAL", "30"))
+KEEPALIVE_PATH = os.environ.get("KEEPALIVE_PATH", "/health")
+# RENDER_EXTERNAL_URL Render подставляет автоматически для web-сервисов
+KEEPALIVE_URL = (
+    os.environ.get("KEEPALIVE_URL")
+    or os.environ.get("RENDER_EXTERNAL_URL")
+    or ""
+).rstrip("/")
 
 SYSTEM_PERSONA = (
     "Ты — дружелюбный собеседник, отвечаешь на русском языке. "
@@ -45,8 +72,8 @@ IMAGE_KEYWORDS = (
     "draw ", "paint "
 )
 
-if not TELEGRAM_BOT_TOKEN or not GIGACHAT_CREDENTIALS:
-    raise RuntimeError("❌ Задайте TELEGRAM_BOT_TOKEN и GIGACHAT_CREDENTIALS!")
+if not TELEGRAM_BOT_TOKEN or not QWEN_API_KEY:
+    raise RuntimeError("❌ Задайте TELEGRAM_BOT_TOKEN и QWEN_API_KEY!")
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 BOT_ME = bot.get_me()
@@ -57,68 +84,90 @@ _rate = {"image": {}, "text": {}}
 _history = {}  # chat_id -> список сообщений диалога
 
 
-# ─────────────────────── GigaChat API ────────────────────────
+# ─────────────────────── Qwen API ────────────────────────
 
-def get_gigachat_token() -> str:
+def _qwen_headers(extra: dict | None = None) -> dict:
+    headers = {
+        "Authorization": f"Bearer {QWEN_API_KEY}",
+        "Accept": "application/json",
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def generate_image(prompt: str) -> bytes:
+    """Генерация картинки через Qwen-Image.
+
+    Асинхронная схема: создаём задачу → опрашиваем статус по task_id →
+    при успехе скачиваем картинку по URL (ссылка живёт 24 часа).
+    """
     resp = requests.post(
-        OAUTH_URL,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-            "RqUID": str(uuid.uuid4()),
-            "Authorization": f"Basic {GIGACHAT_CREDENTIALS}",
-        },
-        data={"scope": "GIGACHAT_API_PERS"},
-        verify=VERIFY_SSL, timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()["access_token"]
-
-
-def generate_image(token: str, prompt: str) -> bytes:
-    """Генерация картинки (function_call: auto)."""
-    resp = requests.post(
-        f"{API_URL}/chat/completions",
-        headers={"Authorization": f"Bearer {token}",
-                 "Content-Type": "application/json"},
+        IMAGE_TASK_URL,
+        headers=_qwen_headers({
+            "Content-Type": "application/json",
+            "X-DashScope-Async": "enable",  # обязателен для HTTP-вызовов
+        }),
         json={
-            "model": "GigaChat-3-Ultra",
-            "messages": [
-                {"role": "system", "content": "Ты — профессиональный художник."},
-                {"role": "user", "content": prompt},
-            ],
-            "function_call": "auto",
+            "model": QWEN_IMAGE_MODEL,
+            "input": {"prompt": prompt},
+            "parameters": {
+                "size": QWEN_IMAGE_SIZE,
+                "n": 1,
+                "prompt_extend": True,   # модель сама дополняет промпт
+                "watermark": False,
+            },
         },
-        verify=VERIFY_SSL, timeout=300,
+        timeout=60,
     )
     resp.raise_for_status()
-    content = resp.json()["choices"][0]["message"].get("content", "")
-    match = re.search(r'<img\s+src="([^"]+)"', content)
-    if not match:
-        raise RuntimeError("GigaChat не вернул картинку")
-    img = requests.get(
-        f"{API_URL}/files/{match.group(1)}/content",
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/jpg"},
-        verify=VERIFY_SSL, timeout=60,
-    )
-    img.raise_for_status()
-    return img.content
+    task_id = resp.json()["output"]["task_id"]
+    logger.info("🖼 Задача генерации создана: %s", task_id)
+
+    deadline = time.time() + IMAGE_TIMEOUT
+    while time.time() < deadline:
+        status = requests.get(
+            f"{TASK_STATUS_URL}/{task_id}",
+            headers=_qwen_headers(), timeout=30,
+        )
+        status.raise_for_status()
+        output = status.json().get("output", {})
+        task_status = output.get("task_status")
+
+        if task_status == "SUCCEEDED":
+            img_url = output["results"][0]["url"]
+            img = requests.get(img_url, timeout=120)
+            img.raise_for_status()
+            logger.info("🖼 Картинка скачана: %d байт", len(img.content))
+            return img.content
+        if task_status in ("FAILED", "CANCELED", "UNKNOWN"):
+            raise RuntimeError(
+                f"Qwen не смог нарисовать: {output.get('code', '')} "
+                f"{output.get('message', task_status)}"
+            )
+        # PENDING / RUNNING — ждём дальше
+        time.sleep(IMAGE_POLL_INTERVAL)
+
+    raise TimeoutError("Генерация картинки заняла слишком много времени")
 
 
-def generate_text(token: str, chat_id: int, user_text: str) -> str:
-    """Текстовый ответ с учётом контекста диалога."""
+def generate_text(chat_id: int, user_text: str) -> str:
+    """Текстовый ответ Qwen с учётом контекста диалога (OpenAI-совместимый API)."""
     history = _history.setdefault(chat_id, [])
     messages = [{"role": "system", "content": SYSTEM_PERSONA}]
     messages += history[-MAX_HISTORY:]
     messages.append({"role": "user", "content": user_text})
 
     resp = requests.post(
-        f"{API_URL}/chat/completions",
-        headers={"Authorization": f"Bearer {token}",
-                 "Content-Type": "application/json"},
-        json={"model": "GigaChat-3-Ultra", "messages": messages,
-              "temperature": 0.7, "max_tokens": 800},
-        verify=VERIFY_SSL, timeout=60,
+        f"{TEXT_API_URL}/chat/completions",
+        headers=_qwen_headers({"Content-Type": "application/json"}),
+        json={
+            "model": QWEN_TEXT_MODEL,
+            "messages": messages,
+            "temperature": 0.7,
+            "max_tokens": 800,
+        },
+        timeout=60,
     )
     resp.raise_for_status()
     answer = resp.json()["choices"][0]["message"]["content"]
@@ -229,8 +278,9 @@ def handle_text(message):
 
 
 def process_image(message, prompt: str):
-    if len(prompt) > MAX_PROMPT_LENGTH:
-        bot.reply_to(message, f"❌ Слишком длинный промпт (макс. {MAX_PROMPT_LENGTH}).")
+    if len(prompt) > MAX_IMAGE_PROMPT_LENGTH:
+        bot.reply_to(message,
+                     f"❌ Слишком длинный промпт (макс. {MAX_IMAGE_PROMPT_LENGTH}).")
         return
     allowed, reason = check_rate_limit("image", message.from_user.id)
     if not allowed:
@@ -240,8 +290,7 @@ def process_image(message, prompt: str):
     bot.send_chat_action(message.chat.id, "upload_photo")
     status = bot.reply_to(message, "🎨 Рисую… это займёт 20-60 сек.")
     try:
-        token = get_gigachat_token()
-        image = generate_image(token, prompt)
+        image = generate_image(prompt)
         try:
             bot.delete_message(message.chat.id, status.message_id)
         except Exception:
@@ -269,8 +318,7 @@ def process_chat(message, text: str):
 
     bot.send_chat_action(message.chat.id, "typing")
     try:
-        token = get_gigachat_token()
-        answer = generate_text(token, message.chat.id, text)
+        answer = generate_text(message.chat.id, text)
         send_long_text(message.chat.id, answer, reply_to=message.message_id)
         logger.info("💬 Ответ в чат %s: %s...", message.chat.id, answer[:60])
     except Exception as e:
@@ -278,7 +326,63 @@ def process_chat(message, text: str):
         bot.reply_to(message, "❌ Не смог ответить, попробуйте ещё раз.")
 
 
+# ─────────────────────── Keep-alive / Render ────────────────────────
+
+class HealthHandler(BaseHTTPRequestHandler):
+    """Минимальный HTTP-сервер: отвечает 200 OK на любой GET.
+
+    Нужен, чтобы сервис имел веб-эндпоинт на Render (тип "Web Service") —
+    на него приходят пинги и health-check.
+    """
+
+    def do_GET(self):
+        body = b"OK"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):  # не спамить логами на каждый пинг
+        pass
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", "10000"))
+    httpd = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    logger.info("🩺 Health-сервер запущен на порту %s", port)
+
+
+def keepalive_loop():
+    """Фоновый поток: каждые KEEPALIVE_INTERVAL секунд отправляет тестовый
+    GET на собственный сервис, чтобы Render не укладывал его спать."""
+    url = f"{KEEPALIVE_URL}{KEEPALIVE_PATH}"
+    logger.info("🔁 Keep-alive: пинг %s каждые %d сек", url, KEEPALIVE_INTERVAL)
+    while True:
+        try:
+            r = requests.get(url, timeout=15)
+            logger.info("🔁 keep-alive → HTTP %s", r.status_code)
+        except Exception as e:
+            logger.warning("🔁 keep-alive ошибка: %s", e)
+        time.sleep(KEEPALIVE_INTERVAL)
+
+
+# ─────────────────────── Запуск ────────────────────────
+
 if __name__ == "__main__":
-    logger.info("🚀 Запуск бота (картинки + общение)")
+    logger.info("🚀 Запуск бота (Qwen: картинки + общение)")
+
+    try:
+        start_health_server()
+    except OSError as e:
+        logger.error("Не удалось поднять health-сервер: %s", e)
+
+    if KEEPALIVE_URL:
+        threading.Thread(target=keepalive_loop, daemon=True).start()
+    else:
+        logger.warning("⚠️ KEEPALIVE_URL/RENDER_EXTERNAL_URL не задан — "
+                       "пинги Render выполняться не будут")
+
     bot.remove_webhook()
     bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
