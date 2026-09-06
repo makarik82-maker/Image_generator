@@ -403,5 +403,11 @@ if __name__ == "__main__":
                                  skip_pending=True)
         except Exception as e:
             logger.error("💥 Поллинг прерван: %s", e)
+            if "409" in str(e) or "Conflict" in str(e):
+                logger.error(
+                    "❗ Где-то работает ВТОРОЙ инстанс бота с тем же токеном: "
+                    "проверьте список сервисов на Render (дубликаты вида "
+                    "Image_generator-1/-2) и локальные запуски — удалите/остановите лишние."
+                )
             logger.info("🔁 Повторный запуск поллинга через 15 сек…")
             time.sleep(15)
