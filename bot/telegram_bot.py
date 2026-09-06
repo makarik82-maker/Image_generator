@@ -22,10 +22,15 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 QWEN_API_KEY = os.environ.get("QWEN_API_KEY")
 
-# Базовый URL DashScope:
+# Базовый URL DashScope (без путей протоколов — код добавит их сам):
 #   Китай (Пекин):  https://dashscope.aliyuncs.com
 #   Сингапур:       https://dashscope-intl.aliyuncs.com
+# Если сюда вставили полный URL с /compatible-mode/v1 или /apps/anthropic —
+# лишние хвосты будут обрезаны автоматически.
 QWEN_BASE_URL = os.environ.get("QWEN_BASE_URL", "https://dashscope.aliyuncs.com").rstrip("/")
+for _suffix in ("/compatible-mode/v1", "/apps/anthropic", "/api/v1"):
+    if QWEN_BASE_URL.endswith(_suffix):
+        QWEN_BASE_URL = QWEN_BASE_URL[: -len(_suffix)]
 
 QWEN_TEXT_MODEL = os.environ.get("QWEN_TEXT_MODEL", "qwen-plus")
 QWEN_IMAGE_MODEL = os.environ.get("QWEN_IMAGE_MODEL", "qwen-image")
@@ -72,8 +77,12 @@ IMAGE_KEYWORDS = (
     "draw ", "paint "
 )
 
-if not TELEGRAM_BOT_TOKEN or not QWEN_API_KEY:
-    raise RuntimeError("❌ Задайте TELEGRAM_BOT_TOKEN и QWEN_API_KEY!")
+_missing = [name for name, val in (
+    ("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN),
+    ("QWEN_API_KEY", QWEN_API_KEY),
+) if not val]
+if _missing:
+    raise RuntimeError("❌ Не заданы переменные окружения: " + ", ".join(_missing))
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 BOT_ME = bot.get_me()
@@ -385,4 +394,14 @@ if __name__ == "__main__":
                        "пинги Render выполняться не будут")
 
     bot.remove_webhook()
-    bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
+    # Устойчивый поллинг: если Telegram вернул 409 Conflict (другой инстанс
+    # бота ещё доживает при rolling-деплое на Render) — ждём и повторяем,
+    # вместо падения процесса.
+    while True:
+        try:
+            bot.infinity_polling(timeout=60, long_polling_timeout=60,
+                                 skip_pending=True)
+        except Exception as e:
+            logger.error("💥 Поллинг прерван: %s", e)
+            logger.info("🔁 Повторный запуск поллинга через 15 сек…")
+            time.sleep(15)
