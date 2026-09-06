@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: gigachat-telegram-bot
+    name: qwen-telegram-bot
     runtime: python
     buildCommand: pip install -r bot/requirements.txt
     startCommand: python bot/telegram_bot.py
@@ -13,6 +13,6 @@ services:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: QWEN_BASE_URL
-        value: https://dashscope.aliyuncs.com
+        value: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
       - key: KEEPALIVE_INTERVAL
         value: "30"
