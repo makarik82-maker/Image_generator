@@ -1,13 +1,18 @@
 services:
-  - type: worker
+  - type: web
     name: gigachat-telegram-bot
     runtime: python
     buildCommand: pip install -r bot/requirements.txt
     startCommand: python bot/telegram_bot.py
+    healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
-      - key: GIGACHAT_CREDENTIALS
+      - key: QWEN_API_KEY
         sync: false
       - key: TELEGRAM_BOT_TOKEN
         sync: false
+      - key: QWEN_BASE_URL
+        value: https://dashscope.aliyuncs.com
+      - key: KEEPALIVE_INTERVAL
+        value: "30"
